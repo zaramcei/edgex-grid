@@ -2,16 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y gcc g++ && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends cmake make gcc g++ curl libgmp-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+ADD https://astral.sh/uv/install.sh /uv-installer.sh
+RUN sh /uv-installer.sh && rm /uv-installer.sh
+ENV PATH="/root/.local/bin/:$PATH"
 
-COPY bot/ ./bot/
-COPY configs/ ./configs/
-COPY scripts/ ./scripts/
-COPY run_edgex_grid.py .
+COPY . .
+
+RUN uv sync --frozen
 
 RUN mkdir -p logs
 
@@ -23,4 +22,4 @@ ENV EDGEX_GRID_FIRST_OFFSET_USD=60
 ENV EDGEX_GRID_SIZE=0.2
 ENV EDGEX_GRID_OP_SPACING_SEC=1.5
 
-CMD ["python", "run_edgex_grid.py"]
+CMD ["uv", "run", "run_edgex_grid.py"]
