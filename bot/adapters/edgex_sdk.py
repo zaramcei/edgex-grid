@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from edgex_sdk import Client as EdgeXClient, OrderSide as SDKOrderSide
+from edgex_sdk.ws.client import Client as WSClient
+from edgex_sdk.internal.starkex_signing_adapter import StarkExSigningAdapter
 import httpx  # for error detail extraction and public API calls
 
 from bot.adapters.base import ExchangeAdapter
@@ -28,6 +30,8 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         self.account_id = int(account_id)
         self.stark_private_key = stark_private_key
         self._client: Optional[EdgeXClient] = None
+        self._ws_client_private: Optional[WSClient] = None
+        self._ws_client_public: Optional[WSClient] = None
         self._market_rules: Dict[str, Dict[str, float]] = {}
         # (best_bid, best_ask, ts_ms)
         self._last_depth: Dict[str, Tuple[Optional[float], Optional[float], int]] = {}
@@ -43,9 +47,365 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         )
 
     async def close(self) -> None:
+        if self._ws_client_private:
+            self._ws_client_private.close()
+            self._ws_client_private = None
+        if self._ws_client_public:
+            self._ws_client_public.close()
+            self._ws_client_public = None
         if self._client:
             await self._client.close()
             self._client = None
+
+    def is_losscut_triggered(self) -> bool:
+        """Check if loss cut condition was triggered
+
+        Returns:
+            bool: True if loss cut was triggered, False otherwise
+        """
+        if self._ws_client_private is None:
+            logger.debug("is_losscut_triggered: _ws_client_private is None")
+            return False
+
+        # Check if attribute exists (for compatibility with old client versions)
+        if not hasattr(self._ws_client_private, 'losscut_triggered'):
+            logger.warning("is_losscut_triggered: WebSocket client does not have losscut_triggered attribute")
+            return False
+
+        result = self._ws_client_private.losscut_triggered
+        if result:
+            logger.warning(f"is_losscut_triggered: returning True (losscut_triggered={result})")
+        return result
+
+    def is_balance_recovery_triggered(self) -> bool:
+        """Check if balance recovery condition was triggered
+
+        Returns:
+            bool: True if balance recovery was triggered, False otherwise
+        """
+        if self._ws_client_private is None:
+            return False
+
+        # Check if attribute exists (for compatibility with old client versions)
+        if not hasattr(self._ws_client_private, 'balance_recovery_triggered'):
+            logger.warning("is_balance_recovery_triggered: WebSocket client does not have balance_recovery_triggered attribute")
+            return False
+
+        return self._ws_client_private.balance_recovery_triggered
+
+    def is_takeprofit_triggered(self) -> bool:
+        """Check if position-based take profit condition was triggered
+
+        Returns:
+            bool: True if position-based take profit was triggered, False otherwise
+        """
+        if self._ws_client_private is None:
+            logger.debug("is_takeprofit_triggered: _ws_client_private is None")
+            return False
+
+        # Check if attribute exists (for compatibility with old client versions)
+        if not hasattr(self._ws_client_private, 'losscut_triggered'):
+            logger.warning("is_takeprofit_triggered: WebSocket client does not have losscut_triggered attribute")
+            return False
+
+        # Position-based take profit reuses the losscut_triggered flag
+        result = self._ws_client_private.losscut_triggered
+        if result:
+            logger.warning(f"is_takeprofit_triggered: returning True (losscut_triggered={result})")
+        return result
+
+    def is_asset_losscut_triggered(self) -> bool:
+        """Check if asset-based loss cut condition was triggered
+
+        Returns:
+            bool: True if asset-based loss cut was triggered, False otherwise
+        """
+        if self._ws_client_private is None:
+            logger.debug("is_asset_losscut_triggered: _ws_client_private is None")
+            return False
+
+        # Check if attribute exists (for compatibility with old client versions)
+        if not hasattr(self._ws_client_private, 'asset_losscut_triggered'):
+            logger.warning("is_asset_losscut_triggered: WebSocket client does not have asset_losscut_triggered attribute")
+            return False
+
+        result = self._ws_client_private.asset_losscut_triggered
+        if result:
+            logger.warning(f"is_asset_losscut_triggered: returning True (asset_losscut_triggered={result})")
+        return result
+
+    def is_asset_takeprofit_triggered(self) -> bool:
+        """Check if asset-based take profit condition was triggered
+
+        Returns:
+            bool: True if asset-based take profit was triggered, False otherwise
+        """
+        if self._ws_client_private is None:
+            logger.debug("is_asset_takeprofit_triggered: _ws_client_private is None")
+            return False
+
+        # Check if attribute exists (for compatibility with old client versions)
+        if not hasattr(self._ws_client_private, 'asset_takeprofit_triggered'):
+            logger.warning("is_asset_takeprofit_triggered: WebSocket client does not have asset_takeprofit_triggered attribute")
+            return False
+
+        result = self._ws_client_private.asset_takeprofit_triggered
+        if result:
+            logger.warning(f"is_asset_takeprofit_triggered: returning True (asset_takeprofit_triggered={result})")
+        return result
+
+    def get_current_price_from_websocket(self) -> Optional[float]:
+        """Get current price from WebSocket ticker data
+
+        Returns:
+            Optional[float]: Current price if available, None otherwise
+        """
+        if self._ws_client_public is None:
+            return None
+
+        if not hasattr(self._ws_client_public, 'current_price'):
+            return None
+
+        return self._ws_client_public.current_price
+
+    async def close_all_positions(self, symbol: str) -> None:
+        """Close all positions for the given symbol
+
+        Args:
+            symbol: Trading symbol (e.g., "10000001")
+        """
+        assert self._client is not None
+
+        try:
+            # Fetch current positions
+            positions = await self.fetch_positions(symbol)
+
+            if not positions:
+                logger.info("No positions to close")
+                return
+
+            for pos_data in positions:
+                try:
+                    # Extract position information
+                    size_str = pos_data.get("size") or pos_data.get("positionSize") or pos_data.get("qty")
+                    side = pos_data.get("side") or pos_data.get("positionSide")
+
+                    if not size_str or not side:
+                        logger.warning(f"Incomplete position data: {pos_data}")
+                        continue
+
+                    size = abs(float(size_str))
+                    if size < 0.0001:  # Skip if position is essentially zero
+                        continue
+
+                    # Determine the side for closing (opposite of current position)
+                    if side == "LONG" or side == "BUY":
+                        close_side = OrderSide.SELL
+                    elif side == "SHORT" or side == "SELL":
+                        close_side = OrderSide.BUY
+                    else:
+                        logger.warning(f"Unknown position side: {side}")
+                        continue
+
+                    logger.warning(f"Closing position: {side} {size} for {symbol}")
+
+                    # Create market order to close position
+                    close_order = OrderRequest(
+                        symbol=symbol,
+                        side=close_side,
+                        type=OrderType.MARKET,
+                        quantity=size,
+                        time_in_force=TimeInForce.IOC,
+                    )
+
+                    # Place the closing order
+                    result = await self.place_order(close_order)
+                    logger.warning(f"Position close order placed: {result.id}")
+
+                except Exception as e:
+                    logger.error(f"Failed to close position: {e}", exc_info=True)
+
+        except Exception as e:
+            logger.error(f"Failed to close positions: {e}", exc_info=True)
+
+    async def close_position_from_websocket(self, symbol: str) -> bool:
+        """Close all positions using WebSocket position data
+
+        This method uses all_positions from WebSocket instead of REST API,
+        which is more reliable for EdgeX. Closes all positions at once.
+
+        Args:
+            symbol: Trading symbol (e.g., "10000001")
+
+        Returns:
+            bool: True if positions were closed, False if no positions to close
+        """
+        assert self._client is not None
+
+        # Check if WebSocket client is available
+        if self._ws_client_private is None:
+            logger.error("WebSocket client not available - cannot close positions")
+            return False
+
+        # Get all positions from WebSocket
+        all_positions = self._ws_client_private.all_positions
+
+        if not all_positions:
+            logger.info("No position data from WebSocket")
+            return False
+
+        try:
+            # Calculate total position size across all positions
+            total_size = 0.0
+            combined_side = None
+
+            for position in all_positions:
+                open_size_str = position.get("openSize")
+                if open_size_str is None:
+                    continue
+
+                size = float(open_size_str)
+
+                # Skip if position is effectively zero
+                if abs(size) < 0.0001:
+                    continue
+
+                # Add to total (sizes are signed: + for LONG, - for SHORT)
+                total_size += size
+
+            # Check if total position is effectively zero
+            if abs(total_size) < 0.0001:
+                logger.info("Total position size is zero - nothing to close")
+                return False
+
+            # Determine side from total size (positive = LONG, negative = SHORT)
+            abs_total_size = abs(total_size)
+            if total_size > 0:
+                side_name = "LONG"
+                close_side = OrderSide.SELL
+            else:
+                side_name = "SHORT"
+                close_side = OrderSide.BUY
+
+            logger.warning(f"Closing all {side_name} positions: total size {abs_total_size} for {symbol}")
+
+            # Create market order to close all positions at once
+            close_order = OrderRequest(
+                symbol=symbol,
+                side=close_side,
+                type=OrderType.MARKET,
+                quantity=abs_total_size,
+                time_in_force=TimeInForce.IOC,
+            )
+
+            # Place the closing order
+            result = await self.place_order(close_order)
+            logger.warning(f"Position close order placed: {result.id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to close positions from WebSocket: {e}", exc_info=True)
+            return False
+
+    def start_position_monitoring(self, symbol: str) -> None:
+        """Start WebSocket connection for position monitoring with unrealized PnL calculation
+
+        Args:
+            symbol: Trading symbol to monitor (e.g., "BTC-PERP")
+        """
+        # Create signing adapter
+        signing_adapter = StarkExSigningAdapter()
+
+        # Get WebSocket base URL from environment variable or derive from REST API base URL
+        ws_base_url = os.getenv("EDGEX_WS_BASE_URL",
+                                "wss://quote.edgex.exchange")
+        if not ws_base_url:
+            # Fallback: derive from REST API base URL
+            ws_base_url = self.base_url.replace("https://", "wss://").replace("http://", "ws://")
+        else:
+            # Ensure it's a WebSocket URL
+            if not ws_base_url.startswith(("ws://", "wss://")):
+                ws_base_url = "wss://" + ws_base_url.lstrip("/")
+
+        # 1. Create and connect private WebSocket for position updates
+        private_ws_url = f"{ws_base_url}/api/v1/private/ws?accountId={self.account_id}"
+
+        self._ws_client_private = WSClient(
+            url=private_ws_url,
+            is_private=True,
+            account_id=self.account_id,
+            stark_pri_key=self.stark_private_key,
+            signing_adapter=signing_adapter
+        )
+
+        # Log with masked account ID for security
+        masked_url = private_ws_url.replace(str(self.account_id), f"***{str(self.account_id)[-4:]}")
+        logger.info(f"プライベートWebSocket接続中: {masked_url}")
+        self._ws_client_private.connect()
+        logger.info(f"プライベートWebSocket接続完了")
+
+        # Enable position monitoring
+        self._ws_client_private.enable_position_monitoring()
+        logger.info(f"ポジション監視を有効化 (レバレッジ: 100倍)")
+
+        # 2. Create and connect public WebSocket for ticker updates
+        try:
+            public_ws_url = f"{ws_base_url}/api/v1/public/ws"
+
+            self._ws_client_public = WSClient(
+                url=public_ws_url,
+                is_private=False,
+                account_id=self.account_id,
+                stark_pri_key=self.stark_private_key,
+                signing_adapter=signing_adapter
+            )
+
+            logger.info(f"公開WebSocket接続中: {public_ws_url}")
+            self._ws_client_public.connect()
+            logger.info(f"公開WebSocket接続完了")
+
+            # Subscribe to ticker channel for the symbol
+            ticker_channel = f"ticker.{symbol}"
+            logger.info(f"Tickerチャンネルに購読中: {ticker_channel}")
+            self._ws_client_public.subscribe(ticker_channel)
+            logger.info(f"Tickerチャンネルの購読完了: {ticker_channel}")
+
+            # Share ticker updates with private client for PnL calculation
+            def ticker_update_handler(message: str) -> None:
+                try:
+                    import json
+                    msg = json.loads(message)
+                    if msg.get("type") == "quote-event":
+                        channel = msg.get("channel", "")
+                        if "ticker" in channel.lower():
+                            # EdgeX ticker structure: quote-event -> content -> data (array) -> data[0]
+                            content = msg.get("content", {})
+                            data_list = content.get("data", [])
+
+                            if not data_list:
+                                return
+
+                            data = data_list[0]
+                            last_price = data.get("lastPrice") or data.get("last_price")
+                            if last_price is not None:
+                                price_float = float(last_price)
+
+                                # Update the public client's current price (for grid trading)
+                                if self._ws_client_public is not None:
+                                    self._ws_client_public.current_price = price_float
+
+                                # Update the private client's current price (for PnL calculation)
+                                if self._ws_client_private is not None:
+                                    self._ws_client_private.current_price = price_float
+                                    self._ws_client_private._calculate_and_log_unrealized_pnl()
+                except Exception as e:
+                    logger.error(f"Error processing ticker update: {e}")
+
+            self._ws_client_public.on_message("ticker", ticker_update_handler)
+
+        except Exception as e:
+            logger.warning(f"Could not subscribe to ticker via public WebSocket: {e}")
+            logger.info("Position monitoring will work, but unrealized PnL calculation requires manual ticker updates")
 
     async def get_ticker(self, symbol: str) -> Ticker:
         assert self._client is not None
@@ -693,64 +1053,8 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         client = self._client
         resp: Any = None
 
-        # 1) Preferred: client.position.get_positions(params)
-        try:
-            if hasattr(client, "position") and hasattr(client.position, "get_positions"):
-                meth = client.position.get_positions
-                import inspect as _inspect
-                params: Dict[str, Any] = {}
-                try:
-                    sig = _inspect.signature(meth)
-                    names = sig.parameters.keys()
-                except Exception:
-                    names = []
-                if "account_id" in names:
-                    params["account_id"] = self.account_id
-                elif "accountId" in names:
-                    params["accountId"] = str(self.account_id)
-                if symbol:
-                    sym = str(symbol)
-                    for k in ("contract_id", "contractId", "symbol", "contractIdList", "symbols"):
-                        if k in names:
-                            params[k] = [sym] if k.endswith("List") or k.endswith("s") else sym
-                resp = await (meth(**params) if params else meth())
-        except Exception:
-            resp = None
-
-        # 2) Fallbacks: common legacy names
-        if resp is None:
-            cand_methods = [
-                (getattr(getattr(client, "position", object()), "get_position_page", None)),
-                getattr(client, "get_positions", None),
-                getattr(client, "get_position_page", None),
-            ]
-            for m in cand_methods:
-                if not callable(m):
-                    continue
-                try:
-                    import inspect as _inspect
-                    params: Dict[str, Any] = {}
-                    try:
-                        sig = _inspect.signature(m)
-                        names = sig.parameters.keys()
-                    except Exception:
-                        names = []
-                    if "account_id" in names:
-                        params["account_id"] = self.account_id
-                    elif "accountId" in names:
-                        params["accountId"] = str(self.account_id)
-                    if symbol:
-                        sym = str(symbol)
-                        for k in ("contract_id", "contractId", "symbol", "contractIdList", "symbols"):
-                            if k in names:
-                                params[k] = [sym] if k.endswith("List") or k.endswith("s") else sym
-                    resp = await (m(**params) if params else m())
-                    if resp is not None:
-                        break
-                except Exception:
-                    resp = None
-
         # Normalize
+        logger.debug("resp_position: {}", resp)
         rows: List[Dict[str, Any]] = []
         try:
             data = resp

@@ -12,6 +12,9 @@ COPY . .
 
 RUN uv sync --frozen
 
+# Copy customized edgex_sdk over the installed version
+RUN cp -r /app/local-packages/edgex_sdk /app/.venv/lib/python3.11/site-packages/
+
 RUN mkdir -p logs
 
 ENV EDGEX_BASE_URL=https://pro.edgex.exchange

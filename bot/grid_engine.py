@@ -153,6 +153,15 @@ class GridEngine:
 
     async def run(self) -> None:
         await self.adapter.connect()
+
+        # Start WebSocket position monitoring if the adapter supports it
+        if hasattr(self.adapter, 'start_position_monitoring'):
+            try:
+                self.adapter.start_position_monitoring(self.symbol)
+                logger.info("WebSocketポジション監視を開始しました")
+            except Exception as e:
+                logger.warning(f"WebSocketポジション監視の開始に失敗: {e}")
+
         self._running = True
         logger.info(
             "グリッドエンジン起動: グリッド幅={}USD レベル数={} サイズ={}BTC",
@@ -173,24 +182,452 @@ class GridEngine:
             while self._running:
                 try:
                     self._loop_iter += 1
-                    logger.debug("グリッドループ開始: iter={} 配置済み買い={}本 配置済み売り={}本 初期化済み={}", 
+                    logger.debug("グリッドループ開始: iter={} 配置済み買い={}本 配置済み売り={}本 初期化済み={}",
                                 self._loop_iter, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id), self.initialized)
 
-                    # 現在価格取得
-                    try:
-                        if getattr(self, "use_ticker_only", False):
-                            ticker = await self.adapter.get_ticker(self.symbol)
-                            mid_price = float(ticker.price)  # ティッカーの最終価格を採用
-                        else:
-                            # まず板の最良気配からミッド算出。無ければティッカー。
-                            bid, ask = await self.adapter.get_best_bid_ask(self.symbol)
-                            if bid is not None and ask is not None:
-                                mid_price = (float(bid) + float(ask)) / 2.0
+                    # Check for loss cut trigger
+                    has_method = hasattr(self.adapter, 'is_losscut_triggered')
+                    is_triggered = self.adapter.is_losscut_triggered() if has_method else False
+                    logger.debug(f"Loss cut check: has_method={has_method}, is_triggered={is_triggered}")
+
+                    if has_method and is_triggered:
+                        logger.error("=" * 80)
+                        logger.error("POSITION LOSS CUT DETECTED - CLOSING ALL POSITIONS")
+                        logger.error("=" * 80)
+
+                        try:
+                            # STEP 1: Close all positions FIRST (stop loss immediately)
+                            logger.warning("STEP 1: Closing all positions immediately...")
+                            if hasattr(self.adapter, 'close_position_from_websocket'):
+                                closed = await self.adapter.close_position_from_websocket(self.symbol)
+                                if closed:
+                                    logger.warning("Initial position close order placed")
+                                else:
+                                    logger.warning("No position to close")
                             else:
+                                logger.error("close_position_from_websocket method not available")
+
+                            # STEP 2: Cancel ALL open orders to prevent new positions
+                            logger.warning("STEP 2: Canceling all open orders to prevent new positions...")
+                            try:
+                                active_orders = await self.adapter.list_active_orders(self.symbol)
+                                cancel_count = 0
+                                for order in active_orders:
+                                    try:
+                                        order_id = (
+                                            order.get("orderId")
+                                            or order.get("id")
+                                            or order.get("order_id")
+                                            or order.get("clientOrderId")
+                                        )
+                                        if order_id:
+                                            await self.adapter.cancel_order(str(order_id))
+                                            cancel_count += 1
+                                            await asyncio.sleep(0.1)
+                                    except Exception as e:
+                                        logger.debug(f"Failed to cancel order {order_id}: {e}")
+                                logger.warning(f"Canceled {cancel_count} open orders")
+
+                                # Clear our internal tracking
+                                self.placed_buy_px_to_id.clear()
+                                self.placed_sell_px_to_id.clear()
+                            except Exception as e:
+                                logger.error(f"Error canceling orders: {e}", exc_info=True)
+
+                            # STEP 3: Re-check and close any remaining positions (in case orders filled during close)
+                            logger.warning("STEP 3: Re-checking for any remaining positions...")
+                            await asyncio.sleep(2.0)  # Wait for orders to settle
+                            if hasattr(self.adapter, 'close_position_from_websocket'):
+                                closed_again = await self.adapter.close_position_from_websocket(self.symbol)
+                                if closed_again:
+                                    logger.warning("Closed remaining positions that opened during initial close")
+                                else:
+                                    logger.info("No remaining positions found - all clear")
+
+                            # STEP 4: Reset the loss cut flag on the WebSocket client
+                            if (hasattr(self.adapter, '_ws_client_private') and
+                                self.adapter._ws_client_private and
+                                hasattr(self.adapter._ws_client_private, 'losscut_triggered')):
+                                self.adapter._ws_client_private.losscut_triggered = False
+
+                            logger.warning("=" * 80)
+                            logger.warning("POSITION LOSS CUT - All positions closed, pausing for cooldown")
+                            logger.warning("=" * 80)
+
+                            # STEP 5: Wait for cooldown period to ensure everything settles
+                            cooldown_sec = 30.0
+                            logger.warning(f"Waiting {cooldown_sec} seconds for positions to settle...")
+                            await asyncio.sleep(cooldown_sec)
+
+                            logger.warning("Cooldown complete, resuming grid trading")
+                            continue
+
+                        except Exception as e:
+                            logger.error(f"Error during loss cut reset: {e}", exc_info=True)
+                            # Continue anyway to avoid stopping the bot
+                            await asyncio.sleep(self.poll_interval_sec)
+                            continue
+
+                    # Check for position-based take profit trigger
+                    if hasattr(self.adapter, 'is_takeprofit_triggered') and self.adapter.is_takeprofit_triggered():
+                        logger.warning("=" * 80)
+                        logger.warning("POSITION TAKE PROFIT DETECTED - CLOSING ALL POSITIONS")
+                        logger.warning("=" * 80)
+
+                        try:
+                            # STEP 1: Close all positions FIRST (lock in profit immediately)
+                            logger.warning("STEP 1: Closing all positions immediately...")
+                            if hasattr(self.adapter, 'close_position_from_websocket'):
+                                closed = await self.adapter.close_position_from_websocket(self.symbol)
+                                if closed:
+                                    logger.warning("Initial position close order placed")
+                                else:
+                                    logger.warning("No position to close")
+                            else:
+                                logger.error("close_position_from_websocket method not available")
+
+                            # STEP 2: Cancel ALL open orders to prevent new positions
+                            logger.warning("STEP 2: Canceling all open orders to prevent new positions...")
+                            try:
+                                active_orders = await self.adapter.list_active_orders(self.symbol)
+                                cancel_count = 0
+                                for order in active_orders:
+                                    try:
+                                        order_id = (
+                                            order.get("orderId")
+                                            or order.get("id")
+                                            or order.get("order_id")
+                                            or order.get("clientOrderId")
+                                        )
+                                        if order_id:
+                                            await self.adapter.cancel_order(str(order_id))
+                                            cancel_count += 1
+                                            await asyncio.sleep(0.1)
+                                    except Exception as e:
+                                        logger.debug(f"Failed to cancel order {order_id}: {e}")
+                                logger.warning(f"Canceled {cancel_count} open orders")
+
+                                # Clear our internal tracking
+                                self.placed_buy_px_to_id.clear()
+                                self.placed_sell_px_to_id.clear()
+                            except Exception as e:
+                                logger.error(f"Error canceling orders: {e}", exc_info=True)
+
+                            # STEP 3: Re-check and close any remaining positions (in case orders filled during close)
+                            logger.warning("STEP 3: Re-checking for any remaining positions...")
+                            await asyncio.sleep(2.0)  # Wait for orders to settle
+                            if hasattr(self.adapter, 'close_position_from_websocket'):
+                                closed_again = await self.adapter.close_position_from_websocket(self.symbol)
+                                if closed_again:
+                                    logger.warning("Closed remaining positions that opened during initial close")
+                                else:
+                                    logger.info("No remaining positions found - all clear")
+
+                            # STEP 4: Reset the take profit flag on the WebSocket client (reuses losscut_triggered flag)
+                            if (hasattr(self.adapter, '_ws_client_private') and
+                                self.adapter._ws_client_private and
+                                hasattr(self.adapter._ws_client_private, 'losscut_triggered')):
+                                self.adapter._ws_client_private.losscut_triggered = False
+
+                            logger.warning("=" * 80)
+                            logger.warning("POSITION TAKE PROFIT - All positions closed, pausing for cooldown")
+                            logger.warning("=" * 80)
+
+                            # STEP 5: Wait for cooldown period to ensure everything settles
+                            cooldown_sec = 30.0
+                            logger.warning(f"Waiting {cooldown_sec} seconds for positions to settle...")
+                            await asyncio.sleep(cooldown_sec)
+
+                            logger.warning("Cooldown complete, resuming grid trading")
+                            continue
+
+                        except Exception as e:
+                            logger.error(f"Error during position take profit: {e}", exc_info=True)
+                            # Continue anyway to avoid stopping the bot
+                            await asyncio.sleep(self.poll_interval_sec)
+                            continue
+
+                    # Check for balance recovery trigger
+                    if hasattr(self.adapter, 'is_balance_recovery_triggered') and self.adapter.is_balance_recovery_triggered():
+                        logger.warning("=" * 80)
+                        logger.warning("BALANCE RECOVERY DETECTED - CLOSING ALL POSITIONS")
+                        logger.warning("=" * 80)
+
+                        try:
+                            # STEP 1: Close all positions FIRST (lock in recovery immediately)
+                            logger.warning("STEP 1: Closing all positions immediately...")
+                            if hasattr(self.adapter, 'close_position_from_websocket'):
+                                closed = await self.adapter.close_position_from_websocket(self.symbol)
+                                if closed:
+                                    logger.warning("Initial position close order placed")
+                                else:
+                                    logger.warning("No position to close")
+                            else:
+                                logger.error("close_position_from_websocket method not available")
+
+                            # STEP 2: Cancel ALL open orders to prevent new positions
+                            logger.warning("STEP 2: Canceling all open orders to prevent new positions...")
+                            try:
+                                active_orders = await self.adapter.list_active_orders(self.symbol)
+                                cancel_count = 0
+                                for order in active_orders:
+                                    try:
+                                        order_id = (
+                                            order.get("orderId")
+                                            or order.get("id")
+                                            or order.get("order_id")
+                                            or order.get("clientOrderId")
+                                        )
+                                        if order_id:
+                                            await self.adapter.cancel_order(str(order_id))
+                                            cancel_count += 1
+                                            await asyncio.sleep(0.1)
+                                    except Exception as e:
+                                        logger.debug(f"Failed to cancel order {order_id}: {e}")
+                                logger.warning(f"Canceled {cancel_count} open orders")
+
+                                # Clear our internal tracking
+                                self.placed_buy_px_to_id.clear()
+                                self.placed_sell_px_to_id.clear()
+                            except Exception as e:
+                                logger.error(f"Error canceling orders: {e}", exc_info=True)
+
+                            # STEP 3: Re-check and close any remaining positions (in case orders filled during close)
+                            logger.warning("STEP 3: Re-checking for any remaining positions...")
+                            await asyncio.sleep(2.0)  # Wait for orders to settle
+                            if hasattr(self.adapter, 'close_position_from_websocket'):
+                                closed_again = await self.adapter.close_position_from_websocket(self.symbol)
+                                if closed_again:
+                                    logger.warning("Closed remaining positions that opened during initial close")
+                                else:
+                                    logger.info("No remaining positions found - all clear")
+
+                            # STEP 4: Reset the balance recovery flag on the WebSocket client
+                            if (hasattr(self.adapter, '_ws_client_private') and
+                                self.adapter._ws_client_private and
+                                hasattr(self.adapter._ws_client_private, 'balance_recovery_triggered')):
+                                self.adapter._ws_client_private.balance_recovery_triggered = False
+
+                            logger.warning("=" * 80)
+                            logger.warning("BALANCE RECOVERY - All positions closed, pausing for cooldown")
+                            logger.warning("=" * 80)
+
+                            # STEP 5: Wait for cooldown period to ensure everything settles
+                            cooldown_sec = 30.0
+                            logger.warning(f"Waiting {cooldown_sec} seconds for positions to settle...")
+                            await asyncio.sleep(cooldown_sec)
+
+                            logger.warning("Cooldown complete, resuming grid trading")
+                            continue
+
+                        except Exception as e:
+                            logger.error(f"Error during balance recovery: {e}", exc_info=True)
+                            # Continue anyway to avoid stopping the bot
+                            await asyncio.sleep(self.poll_interval_sec)
+                            continue
+
+                    # Check for asset-based loss cut trigger
+                    has_losscut_method = hasattr(self.adapter, 'is_asset_losscut_triggered')
+                    is_losscut_triggered = self.adapter.is_asset_losscut_triggered() if has_losscut_method else False
+                    logger.info(f"Asset loss cut check: has_method={has_losscut_method}, is_triggered={is_losscut_triggered}")
+
+                    if has_losscut_method and is_losscut_triggered:
+                        logger.error("=" * 80)
+                        logger.error("ASSET-BASED LOSS CUT DETECTED - CLOSING ALL POSITIONS")
+                        logger.error("=" * 80)
+
+                        try:
+                            # STEP 1: Close all positions FIRST (stop loss immediately)
+                            logger.warning("STEP 1: Closing all positions immediately...")
+                            if hasattr(self.adapter, 'close_position_from_websocket'):
+                                closed = await self.adapter.close_position_from_websocket(self.symbol)
+                                if closed:
+                                    logger.warning("Initial position close order placed")
+                                else:
+                                    logger.warning("No position to close")
+                            else:
+                                logger.error("close_position_from_websocket method not available")
+
+                            # STEP 2: Cancel ALL open orders to prevent new positions
+                            logger.warning("STEP 2: Canceling all open orders to prevent new positions...")
+                            try:
+                                active_orders = await self.adapter.list_active_orders(self.symbol)
+                                cancel_count = 0
+                                for order in active_orders:
+                                    try:
+                                        order_id = (
+                                            order.get("orderId")
+                                            or order.get("id")
+                                            or order.get("order_id")
+                                            or order.get("clientOrderId")
+                                        )
+                                        if order_id:
+                                            await self.adapter.cancel_order(str(order_id))
+                                            cancel_count += 1
+                                            await asyncio.sleep(0.1)
+                                    except Exception as e:
+                                        logger.debug(f"Failed to cancel order {order_id}: {e}")
+                                logger.warning(f"Canceled {cancel_count} open orders")
+
+                                # Clear our internal tracking
+                                self.placed_buy_px_to_id.clear()
+                                self.placed_sell_px_to_id.clear()
+                            except Exception as e:
+                                logger.error(f"Error canceling orders: {e}", exc_info=True)
+
+                            # STEP 3: Re-check and close any remaining positions (in case orders filled during close)
+                            logger.warning("STEP 3: Re-checking for any remaining positions...")
+                            await asyncio.sleep(2.0)  # Wait for orders to settle
+                            if hasattr(self.adapter, 'close_position_from_websocket'):
+                                closed_again = await self.adapter.close_position_from_websocket(self.symbol)
+                                if closed_again:
+                                    logger.warning("Closed remaining positions that opened during initial close")
+                                else:
+                                    logger.info("No remaining positions found - all clear")
+
+                            # STEP 4: Reset the asset loss cut flag and update initial asset
+                            if (hasattr(self.adapter, '_ws_client_private') and
+                                self.adapter._ws_client_private and
+                                hasattr(self.adapter._ws_client_private, 'asset_losscut_triggered')):
+                                self.adapter._ws_client_private.asset_losscut_triggered = False
+
+                                # Update initial asset to current asset to reset the baseline
+                                if hasattr(self.adapter._ws_client_private, 'current_balance'):
+                                    current_balance = self.adapter._ws_client_private.current_balance
+                                    if current_balance is not None:
+                                        self.adapter._ws_client_private.initial_asset = current_balance
+                                        logger.warning(f"Reset initial asset to current balance: {current_balance:.2f} USD")
+
+                            logger.warning("=" * 80)
+                            logger.warning("ASSET-BASED LOSS CUT - All positions closed, pausing for cooldown")
+                            logger.warning("=" * 80)
+
+                            # STEP 5: Wait for cooldown period to ensure everything settles
+                            cooldown_sec = 30.0
+                            logger.warning(f"Waiting {cooldown_sec} seconds for positions to settle...")
+                            await asyncio.sleep(cooldown_sec)
+
+                            logger.warning("Cooldown complete, resuming grid trading")
+                            continue
+
+                        except Exception as e:
+                            logger.error(f"Error during asset-based loss cut: {e}", exc_info=True)
+                            # Continue anyway to avoid stopping the bot
+                            await asyncio.sleep(self.poll_interval_sec)
+                            continue
+
+                    # Check for asset-based take profit trigger
+                    if hasattr(self.adapter, 'is_asset_takeprofit_triggered') and self.adapter.is_asset_takeprofit_triggered():
+                        logger.warning("=" * 80)
+                        logger.warning("ASSET-BASED TAKE PROFIT DETECTED - CLOSING ALL POSITIONS")
+                        logger.warning("=" * 80)
+
+                        try:
+                            # STEP 1: Close all positions FIRST (lock in profit immediately)
+                            logger.warning("STEP 1: Closing all positions immediately...")
+                            if hasattr(self.adapter, 'close_position_from_websocket'):
+                                closed = await self.adapter.close_position_from_websocket(self.symbol)
+                                if closed:
+                                    logger.warning("Initial position close order placed")
+                                else:
+                                    logger.warning("No position to close")
+                            else:
+                                logger.error("close_position_from_websocket method not available")
+
+                            # STEP 2: Cancel ALL open orders to prevent new positions
+                            logger.warning("STEP 2: Canceling all open orders to prevent new positions...")
+                            try:
+                                active_orders = await self.adapter.list_active_orders(self.symbol)
+                                cancel_count = 0
+                                for order in active_orders:
+                                    try:
+                                        order_id = (
+                                            order.get("orderId")
+                                            or order.get("id")
+                                            or order.get("order_id")
+                                            or order.get("clientOrderId")
+                                        )
+                                        if order_id:
+                                            await self.adapter.cancel_order(str(order_id))
+                                            cancel_count += 1
+                                            await asyncio.sleep(0.1)
+                                    except Exception as e:
+                                        logger.debug(f"Failed to cancel order {order_id}: {e}")
+                                logger.warning(f"Canceled {cancel_count} open orders")
+
+                                # Clear our internal tracking
+                                self.placed_buy_px_to_id.clear()
+                                self.placed_sell_px_to_id.clear()
+                            except Exception as e:
+                                logger.error(f"Error canceling orders: {e}", exc_info=True)
+
+                            # STEP 3: Re-check and close any remaining positions (in case orders filled during close)
+                            logger.warning("STEP 3: Re-checking for any remaining positions...")
+                            await asyncio.sleep(2.0)  # Wait for orders to settle
+                            if hasattr(self.adapter, 'close_position_from_websocket'):
+                                closed_again = await self.adapter.close_position_from_websocket(self.symbol)
+                                if closed_again:
+                                    logger.warning("Closed remaining positions that opened during initial close")
+                                else:
+                                    logger.info("No remaining positions found - all clear")
+
+                            # STEP 4: Reset the asset take profit flag and update initial asset
+                            if (hasattr(self.adapter, '_ws_client_private') and
+                                self.adapter._ws_client_private and
+                                hasattr(self.adapter._ws_client_private, 'asset_takeprofit_triggered')):
+                                self.adapter._ws_client_private.asset_takeprofit_triggered = False
+
+                                # Update initial asset to current asset to reset the baseline
+                                if hasattr(self.adapter._ws_client_private, 'current_balance'):
+                                    current_balance = self.adapter._ws_client_private.current_balance
+                                    if current_balance is not None:
+                                        self.adapter._ws_client_private.initial_asset = current_balance
+                                        logger.warning(f"Reset initial asset to current balance: {current_balance:.2f} USD")
+
+                            logger.warning("=" * 80)
+                            logger.warning("ASSET-BASED TAKE PROFIT - All positions closed, pausing for cooldown")
+                            logger.warning("=" * 80)
+
+                            # STEP 5: Wait for cooldown period to ensure everything settles
+                            cooldown_sec = 30.0
+                            logger.warning(f"Waiting {cooldown_sec} seconds for positions to settle...")
+                            await asyncio.sleep(cooldown_sec)
+
+                            logger.warning("Cooldown complete, resuming grid trading")
+                            continue
+
+                        except Exception as e:
+                            logger.error(f"Error during asset-based take profit: {e}", exc_info=True)
+                            # Continue anyway to avoid stopping the bot
+                            await asyncio.sleep(self.poll_interval_sec)
+                            continue
+
+                    # 現在価格取得 - WebSocketから取得（レート制限回避）
+                    try:
+                        # まずWebSocketから価格を取得
+                        mid_price = None
+                        if hasattr(self.adapter, 'get_current_price_from_websocket'):
+                            ws_price = self.adapter.get_current_price_from_websocket()
+                            if ws_price is not None:
+                                mid_price = ws_price
+                                logger.debug(f"Using WebSocket price: {mid_price}")
+
+                        # WebSocket価格が取得できない場合のみREST APIにフォールバック
+                        if mid_price is None:
+                            if getattr(self, "use_ticker_only", False):
                                 ticker = await self.adapter.get_ticker(self.symbol)
                                 mid_price = float(ticker.price)
+                            else:
+                                # まず板の最良気配からミッド算出。無ければティッカー。
+                                bid, ask = await self.adapter.get_best_bid_ask(self.symbol)
+                                if bid is not None and ask is not None:
+                                    mid_price = (float(bid) + float(ask)) / 2.0
+                                else:
+                                    ticker = await self.adapter.get_ticker(self.symbol)
+                                    mid_price = float(ticker.price)
+                            logger.debug(f"Using REST API price: {mid_price}")
                     except Exception as e:
-                        logger.warning("ティッカー取得に失敗: {}", e)
+                        logger.warning("価格取得に失敗: {}", e)
                         await asyncio.sleep(self.poll_interval_sec)
                         continue
 
