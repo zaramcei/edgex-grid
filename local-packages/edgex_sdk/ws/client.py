@@ -678,8 +678,10 @@ class Client:
 
                 # Handle account/collateral updates (for balance tracking)
                 # Process this after position updates to ensure current_position is set
+                # Enable balance tracking if BALANCE_RECOVERY_ENABLED or ASSET_LOSSCUT/TAKEPROFIT is configured
                 collateral_list = data.get("collateral", [])
-                if collateral_list and BALANCE_RECOVERY_ENABLED:
+                needs_balance_tracking = BALANCE_RECOVERY_ENABLED or ASSET_LOSSCUT_PERCENTAGE > 0 or ASSET_TAKEPROFIT_PERCENTAGE > 0
+                if collateral_list and needs_balance_tracking:
                     for collateral_data in collateral_list:
                         # Extract available balance
                         amount = collateral_data.get("amount")
