@@ -567,8 +567,9 @@ class Client:
                         self.logger.warning(f"Recovery complete - closing all positions to lock in profits")
                         self.logger.warning("=" * 80)
 
-            # Check asset-based loss cut condition
-            if self.current_balance is not None and ASSET_LOSSCUT_PERCENTAGE > 0:
+            # Check asset-based loss cut / take profit conditions
+            # Either ASSET_LOSSCUT_PERCENTAGE or ASSET_TAKEPROFIT_PERCENTAGE being set enables this block
+            if self.current_balance is not None and (ASSET_LOSSCUT_PERCENTAGE > 0 or ASSET_TAKEPROFIT_PERCENTAGE > 0):
                 # Calculate total asset (current balance + unrealized PnL)
                 total_asset = self.current_balance + total_unrealized_pnl
 
@@ -583,7 +584,7 @@ class Client:
                     asset_change_percentage = (asset_change / self.initial_asset) * 100
 
                     # Trigger loss cut if total asset drops below threshold
-                    if asset_change_percentage <= -abs(ASSET_LOSSCUT_PERCENTAGE):
+                    if ASSET_LOSSCUT_PERCENTAGE > 0 and asset_change_percentage <= -abs(ASSET_LOSSCUT_PERCENTAGE):
                         if not self.asset_losscut_triggered:
                             self.asset_losscut_triggered = True
                             self.logger.error("=" * 80)
