@@ -295,7 +295,7 @@ class EdgeXSDKAdapter(ExchangeAdapter):
                 side=close_side,
                 type=OrderType.MARKET,
                 quantity=abs_total_size,
-                time_in_force=TimeInForce.IOC,
+                price=0,  # MARKET注文ではprice=0
             )
 
             # Place the closing order
@@ -442,6 +442,13 @@ class EdgeXSDKAdapter(ExchangeAdapter):
 
     async def get_best_bid_ask(self, symbol: str) -> tuple[float | None, float | None]:
         """EdgeXの板: SDK→HTTPの順で最大リトライ。成功時は短期キャッシュ。"""
+        # キャッシュが新鮮なら即返却（APIコール削減で429対策）
+        cached = self._last_depth.get(str(symbol))
+        if cached:
+            cbid, cask, ts = cached
+            if self._now_ms() - ts <= 1500 and cbid is not None and cask is not None:
+                return cbid, cask
+
         def _extract_bba(container: Any) -> tuple[float | None, float | None]:
             """Extract (bid, ask) from common depth shapes: dict or list-of-dict."""
             def _px(arr) -> float | None:
@@ -785,16 +792,28 @@ class EdgeXSDKAdapter(ExchangeAdapter):
             order_timeout = 8.0
 
         try:
-            res = await asyncio.wait_for(
-                self._client.create_limit_order(
-                    contract_id=contract_id,
-                    size=str(qty),
-                    price=str(price),
-                    side=side,
-                    **extra_params,
-                ),
-                timeout=order_timeout,
-            )
+            if order.type == OrderType.MARKET:
+                # MARKET注文
+                res = await asyncio.wait_for(
+                    self._client.create_market_order(
+                        contract_id=contract_id,
+                        size=str(qty),
+                        side=side,
+                    ),
+                    timeout=order_timeout,
+                )
+            else:
+                # LIMIT注文
+                res = await asyncio.wait_for(
+                    self._client.create_limit_order(
+                        contract_id=contract_id,
+                        size=str(qty),
+                        price=str(price),
+                        side=side,
+                        **extra_params,
+                    ),
+                    timeout=order_timeout,
+                )
         except Exception as e:
             # Extract as much detail as possible from SDK/httpx error
             detail: Dict[str, Any] = {"payload": payload}

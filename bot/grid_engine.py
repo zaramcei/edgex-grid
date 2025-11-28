@@ -13,6 +13,7 @@ from loguru import logger
 from bot.adapters.base import ExchangeAdapter
 from bot.models.types import OrderRequest, OrderSide, OrderType, TimeInForce
 from bot.utils.trade_logger import TradeLogger
+from bot.schedule_manager import ScheduleManager
 
 class GridEngine:
     """**STEP毎に両サイドへグリッド指値を差し続けなくしたエンジン.
@@ -63,6 +64,15 @@ class GridEngine:
         # 既に出した価格（重複防止）
         self.placed_buy_px_to_id: Dict[float, str] = {}
         self.placed_sell_px_to_id: Dict[float, str] = {}
+
+        # 定期クリア用タイムスタンプ（1時間に1回）
+        self._last_placed_clear_ts: float = time.time()
+        self._placed_clear_interval_sec: float = 3600.0  # 1時間
+
+        # 自己クロス回避でスキップされた注文のカウント
+        self._self_cross_skip_count: int = 0
+        self._last_skip_clear_ts: float = time.time()
+        self._skip_clear_interval_sec: float = 3600.0  # 1時間
 
         self.tlog = TradeLogger()
         # closed PnL poll interval (sec). 0 to disable.
@@ -144,6 +154,152 @@ class GridEngine:
         except Exception:
             self.max_shift_per_loop = 1
 
+        # スケジュール機能の有効/無効
+        use_schedule_env = os.getenv("EDGEX_USE_SCHEDULE", "").lower().strip()
+        # 空欄または未設定 → True、"false"/"0"/"no" → False
+        if use_schedule_env in ("false", "0", "no"):
+            self.use_schedule = False
+        else:
+            self.use_schedule = True
+
+        # スケジュールマネージャー
+        self.schedule_manager = ScheduleManager()
+        self._last_schedule_active: bool | None = None  # 前回のアクティブ状態（変化検知用）
+
+        if self.use_schedule:
+            logger.info("スケジュール機能: 有効")
+        else:
+            logger.info("スケジュール機能: 無効 (EDGEX_USE_SCHEDULE=false)")
+
+        # ポジションサイズ制限 (BTC絶対値)
+        try:
+            # この値以上になったらREDUCE_MODEに移行
+            self.position_size_limit = float(os.getenv("EDGEX_POSITION_SIZE_LIMIT_BTC", "0"))
+        except Exception:
+            self.position_size_limit = 0.0
+        try:
+            # REDUCE_MODEでこの値を下回るまでポジション積み増し禁止
+            self.position_size_reduce_only = float(os.getenv("EDGEX_POSITION_SIZE_REDUCE_ONLY_BTC", "0"))
+        except Exception:
+            self.position_size_reduce_only = 0.0
+
+        # ポジションサイズ制限 (RATIO: 総資産に対する割合 0.0~1.0)
+        # 式: (現在BTC価格 * ポジションサイズ) / 総資産
+        try:
+            self.position_ratio_limit = float(os.getenv("EDGEX_POSITION_SIZE_LIMIT_RATIO", "0"))
+        except Exception:
+            self.position_ratio_limit = 0.0
+        try:
+            self.position_ratio_reduce_only = float(os.getenv("EDGEX_POSITION_SIZE_REDUCE_ONLY_RATIO", "0"))
+        except Exception:
+            self.position_ratio_reduce_only = 0.0
+
+        # バリデーション: BTCとRATIOは排他的に設定する必要がある
+        has_btc = self.position_size_limit > 0 or self.position_size_reduce_only > 0
+        has_ratio = self.position_ratio_limit > 0 or self.position_ratio_reduce_only > 0
+
+        if has_btc and has_ratio:
+            logger.error("=" * 80)
+            logger.error("設定エラー: BTCとRATIOのポジション制限は排他的に設定してください")
+            logger.error("  BTC設定: LIMIT={}, REDUCE_ONLY={}", self.position_size_limit, self.position_size_reduce_only)
+            logger.error("  RATIO設定: LIMIT={}, REDUCE_ONLY={}", self.position_ratio_limit, self.position_ratio_reduce_only)
+            logger.error("どちらか一方のみを設定してください")
+            logger.error("=" * 80)
+            raise SystemExit(1)
+
+        if not has_btc and not has_ratio:
+            logger.error("=" * 80)
+            logger.error("設定エラー: ポジションサイズ制限が設定されていません")
+            logger.error("以下のいずれかを設定してください:")
+            logger.error("  BTC: EDGEX_POSITION_SIZE_LIMIT_BTC / EDGEX_POSITION_SIZE_REDUCE_ONLY_BTC")
+            logger.error("  RATIO: EDGEX_POSITION_SIZE_LIMIT_RATIO / EDGEX_POSITION_SIZE_REDUCE_ONLY_RATIO")
+            logger.error("=" * 80)
+            raise SystemExit(1)
+
+        # 設定されている場合、LIMITとREDUCE_ONLYの両方が必要
+        if has_btc:
+            if self.position_size_limit <= 0 or self.position_size_reduce_only <= 0:
+                logger.error("=" * 80)
+                logger.error("設定エラー: BTC制限はLIMITとREDUCE_ONLYの両方を設定する必要があります")
+                logger.error("  EDGEX_POSITION_SIZE_LIMIT_BTC={}", self.position_size_limit)
+                logger.error("  EDGEX_POSITION_SIZE_REDUCE_ONLY_BTC={}", self.position_size_reduce_only)
+                logger.error("=" * 80)
+                raise SystemExit(1)
+            if self.position_size_reduce_only >= self.position_size_limit:
+                logger.error("=" * 80)
+                logger.error("設定エラー: REDUCE_ONLY_BTCはLIMIT_BTCより小さい必要があります")
+                logger.error("  LIMIT_BTC={} > REDUCE_ONLY_BTC={} であるべき", self.position_size_limit, self.position_size_reduce_only)
+                logger.error("=" * 80)
+                raise SystemExit(1)
+            logger.info(
+                "ポジション制限(BTC): LIMIT={:.4f} BTC, REDUCE_ONLY={:.4f} BTC",
+                self.position_size_limit, self.position_size_reduce_only
+            )
+
+        if has_ratio:
+            if self.position_ratio_limit <= 0 or self.position_ratio_reduce_only <= 0:
+                logger.error("=" * 80)
+                logger.error("設定エラー: RATIO制限はLIMITとREDUCE_ONLYの両方を設定する必要があります")
+                logger.error("  EDGEX_POSITION_SIZE_LIMIT_RATIO={}", self.position_ratio_limit)
+                logger.error("  EDGEX_POSITION_SIZE_REDUCE_ONLY_RATIO={}", self.position_ratio_reduce_only)
+                logger.error("=" * 80)
+                raise SystemExit(1)
+            if self.position_ratio_reduce_only >= self.position_ratio_limit:
+                logger.error("=" * 80)
+                logger.error("設定エラー: REDUCE_ONLY_RATIOはLIMIT_RATIOより小さい必要があります")
+                logger.error("  LIMIT_RATIO={} > REDUCE_ONLY_RATIO={} であるべき", self.position_ratio_limit, self.position_ratio_reduce_only)
+                logger.error("=" * 80)
+                raise SystemExit(1)
+            logger.info(
+                "ポジション制限(RATIO): LIMIT={:.2f}%, REDUCE_ONLY={:.2f}%",
+                self.position_ratio_limit, self.position_ratio_reduce_only
+            )
+
+        self._reduce_mode = False  # REDUCE_MODEフラグ
+
+    async def _cancel_position_side_orders(self, pos_side: str) -> None:
+        """REDUCE_MODE突入時にポジション積み増し方向の既存注文をキャンセルする.
+
+        Args:
+            pos_side: ポジションサイド ("LONG" or "SHORT")
+        """
+        if pos_side == "LONG":
+            # LONGポジション → BUY注文をキャンセル
+            orders_to_cancel = dict(self.placed_buy_px_to_id)
+            side_name = "BUY"
+        elif pos_side == "SHORT":
+            # SHORTポジション → SELL注文をキャンセル
+            orders_to_cancel = dict(self.placed_sell_px_to_id)
+            side_name = "SELL"
+        else:
+            return
+
+        if not orders_to_cancel:
+            logger.info("REDUCE_MODE: キャンセル対象の{}注文なし", side_name)
+            return
+
+        logger.warning(
+            "REDUCE_MODE: ポジション積み増し方向({})の既存注文を全キャンセル 対象={}件",
+            side_name, len(orders_to_cancel)
+        )
+
+        cancel_count = 0
+        for px, order_id in orders_to_cancel.items():
+            try:
+                await self.adapter.cancel_order(str(order_id))
+                cancel_count += 1
+                # 内部トラッキングから削除
+                if pos_side == "LONG":
+                    self.placed_buy_px_to_id.pop(px, None)
+                else:
+                    self.placed_sell_px_to_id.pop(px, None)
+                logger.debug("キャンセル成功: {} price=${:.1f} ID={}", side_name, px, order_id)
+                await asyncio.sleep(0.05)  # レート制限対策
+            except Exception as e:
+                logger.debug("キャンセル失敗: {} price=${:.1f} ID={} error={}", side_name, px, order_id, e)
+
+        logger.warning("REDUCE_MODE: {}注文 {}件をキャンセル完了", side_name, cancel_count)
+
     def _has_min_gap(self, side_map: Dict[float, str], px: float) -> bool:
         """Return True if `px` is at least `self.step` away from all existing prices in `side_map`."""
         for existing_price in side_map.keys():
@@ -184,6 +340,35 @@ class GridEngine:
                     self._loop_iter += 1
                     logger.debug("グリッドループ開始: iter={} 配置済み買い={}本 配置済み売り={}本 初期化済み={}",
                                 self._loop_iter, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id), self.initialized)
+
+                    # 定期クリア処理（1時間に1回）
+                    self._periodic_clear_placed_maps()
+
+                    # スケジュールチェック（5分に1回取得）
+                    if self.use_schedule:
+                        await self.schedule_manager.fetch_schedule()
+                        is_schedule_active = self.schedule_manager.is_active()
+
+                        # スケジュール状態の変化を検知
+                        if self._last_schedule_active is not None and self._last_schedule_active != is_schedule_active:
+                            if is_schedule_active:
+                                # スケジュール外 → スケジュール内に入った
+                                schedule = self.schedule_manager.get_current_schedule()
+                                title = schedule.get("title", "Unknown") if schedule else "Unknown"
+                                logger.warning("=" * 80)
+                                logger.warning("SCHEDULE ACTIVATED: {}", title)
+                                logger.warning("=" * 80)
+                            else:
+                                # スケジュール内 → スケジュール外に出た
+                                await self._handle_schedule_exit()
+
+                        self._last_schedule_active = is_schedule_active
+
+                        # スケジュール外なら待機してcontinue
+                        if not is_schedule_active:
+                            logger.debug("スケジュール外のため待機中...")
+                            await asyncio.sleep(self.poll_interval_sec)
+                            continue
 
                     # Check for loss cut trigger
                     has_method = hasattr(self.adapter, 'is_losscut_triggered')
@@ -1203,16 +1388,156 @@ class GridEngine:
             logger.info("初回グリッド配置完了: 買い{}本 売り{}本", 
                        len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
 
-    async def _place_order(self, side: OrderSide, price: float):
-        """注文を発注"""
-        req = OrderRequest(
-            symbol=self.symbol,
-            side=side,
-            type=OrderType.LIMIT,
-            quantity=self.size,
-            price=price,
-            time_in_force=TimeInForce.POST_ONLY  # ← MAKER注文（手数料リベート）
-        )
+    def _get_current_position_size_and_side(self) -> tuple[float, str | None]:
+        """WebSocketから現在のポジションサイズと方向を取得
+
+        Returns:
+            tuple[float, str | None]: (絶対サイズ, 方向 "LONG"/"SHORT"/None)
+        """
+        if not hasattr(self.adapter, '_ws_client_private') or self.adapter._ws_client_private is None:
+            return 0.0, None
+
+        all_positions = self.adapter._ws_client_private.all_positions
+        if not all_positions:
+            return 0.0, None
+
+        total_size = 0.0
+        for position in all_positions:
+            open_size_str = position.get("openSize")
+            if open_size_str is None:
+                continue
+            size = float(open_size_str)
+            if abs(size) < 0.0001:
+                continue
+            total_size += size
+
+        if abs(total_size) < 0.0001:
+            return 0.0, None
+
+        pos_side = "LONG" if total_size > 0 else "SHORT"
+        return abs(total_size), pos_side
+
+    async def _place_order(self, side: OrderSide, price: float, order_type: OrderType = OrderType.LIMIT):
+        """注文を発注
+
+        Args:
+            side: 注文サイド (BUY/SELL)
+            price: 価格 (MARKET注文の場合は無視される)
+            order_type: 注文タイプ (デフォルト: LIMIT)
+        """
+        # ポジションサイズ制限チェック (BTC絶対値 または RATIO)
+        has_btc_limit = self.position_size_limit > 0 or self.position_size_reduce_only > 0
+        has_ratio_limit = self.position_ratio_limit > 0 or self.position_ratio_reduce_only > 0
+
+        if has_btc_limit or has_ratio_limit:
+            pos_size, pos_side = self._get_current_position_size_and_side()
+
+            # === BTC絶対値による判定 ===
+            if has_btc_limit:
+                # REDUCE_MODEの判定
+                if self.position_size_limit > 0 and pos_size >= self.position_size_limit:
+                    if not self._reduce_mode:
+                        logger.warning(
+                            "REDUCE_MODE突入(BTC): ポジションサイズ {:.4f} BTC >= 上限 {:.4f} BTC",
+                            pos_size, self.position_size_limit
+                        )
+                        self._reduce_mode = True
+                        # ポジション積み増し方向の既存注文をキャンセル
+                        if pos_side is not None:
+                            await self._cancel_position_side_orders(pos_side)
+
+                # REDUCE_MODE解除判定
+                if self._reduce_mode and self.position_size_reduce_only > 0:
+                    if pos_size < self.position_size_reduce_only:
+                        logger.warning(
+                            "REDUCE_MODE解除(BTC): ポジションサイズ {:.4f} BTC < 閾値 {:.4f} BTC",
+                            pos_size, self.position_size_reduce_only
+                        )
+                        self._reduce_mode = False
+
+            # === RATIO (総資産比率) による判定 ===
+            if has_ratio_limit and pos_size > 0:
+                # 現在のBTC価格を取得
+                btc_price = None
+                if hasattr(self.adapter, 'get_current_price_from_websocket'):
+                    btc_price = self.adapter.get_current_price_from_websocket()
+                if btc_price is None or btc_price <= 0:
+                    # WebSocketから取得できない場合はスキップ（RATIOチェックは行わない）
+                    btc_price = None
+
+                # 総資産（initial_asset）を取得
+                initial_asset = None
+                if (hasattr(self.adapter, '_ws_client_private') and
+                    self.adapter._ws_client_private is not None and
+                    hasattr(self.adapter._ws_client_private, 'initial_asset')):
+                    initial_asset = self.adapter._ws_client_private.initial_asset
+
+                if btc_price is not None and initial_asset is not None and initial_asset > 0:
+                    # 式: (現在BTC価格 * ポジションサイズ) / 総資産
+                    position_value_usd = btc_price * pos_size
+                    current_ratio = position_value_usd / initial_asset
+
+                    # REDUCE_MODEの判定
+                    if self.position_ratio_limit > 0 and current_ratio >= self.position_ratio_limit:
+                        if not self._reduce_mode:
+                            logger.warning(
+                                "REDUCE_MODE突入(RATIO): {:.4f} >= 上限 {:.4f} (pos={:.4f}BTC, price={:.0f}USD, asset={:.0f}USD)",
+                                current_ratio, self.position_ratio_limit, pos_size, btc_price, initial_asset
+                            )
+                            self._reduce_mode = True
+                            # ポジション積み増し方向の既存注文をキャンセル
+                            if pos_side is not None:
+                                await self._cancel_position_side_orders(pos_side)
+
+                    # REDUCE_MODE解除判定
+                    if self._reduce_mode and self.position_ratio_reduce_only > 0:
+                        if current_ratio < self.position_ratio_reduce_only:
+                            logger.warning(
+                                "REDUCE_MODE解除(RATIO): {:.4f} < 閾値 {:.4f} (pos={:.4f}BTC, price={:.0f}USD, asset={:.0f}USD)",
+                                current_ratio, self.position_ratio_reduce_only, pos_size, btc_price, initial_asset
+                            )
+                            self._reduce_mode = False
+
+            # REDUCE_MODEでポジション積み増し方向の注文をスキップ
+            if self._reduce_mode and pos_side is not None:
+                # LONG保持中にBUY → 積み増し → スキップ
+                # SHORT保持中にSELL → 積み増し → スキップ
+                is_increasing = (
+                    (pos_side == "LONG" and side == OrderSide.BUY) or
+                    (pos_side == "SHORT" and side == OrderSide.SELL)
+                )
+                if is_increasing:
+                    logger.debug(
+                        "REDUCE_MODE: ポジション積み増し注文をスキップ side={} pos_side={} pos_size={:.4f}",
+                        side, pos_side, pos_size
+                    )
+                    return
+
+        # スケジュールのlot_coefficientを適用
+        lot_coeff = self.schedule_manager.get_lot_coefficient()
+        if lot_coeff <= 0:
+            lot_coeff = 1.0
+        quantity = self.size * lot_coeff
+
+        if order_type == OrderType.MARKET:
+            # MARKET注文: price=0, time_in_forceは設定しない
+            req = OrderRequest(
+                symbol=self.symbol,
+                side=side,
+                type=OrderType.MARKET,
+                quantity=quantity,
+                price=0,
+            )
+        else:
+            # LIMIT注文: priceとPOST_ONLYを設定
+            req = OrderRequest(
+                symbol=self.symbol,
+                side=side,
+                type=OrderType.LIMIT,
+                quantity=quantity,
+                price=price,
+                time_in_force=TimeInForce.POST_ONLY  # ← MAKER注文（手数料リベート）
+            )
         
         try:
             # シンプルモード: 取引所全体の同サイドOPENとの距離チェックを省略（高速化）
@@ -1245,9 +1570,13 @@ class GridEngine:
             # 自己クロス防止: 反対サイドに同値があればスキップ
             if side == OrderSide.BUY and price in self.placed_sell_px_to_id:
                 logger.debug("自己クロス回避: BUYをスキップ 価格=${:.1f}", price)
+                self._self_cross_skip_count += 1
+                self._check_and_clear_on_excessive_skips()
                 return
             if side == OrderSide.SELL and price in self.placed_buy_px_to_id:
                 logger.debug("自己クロス回避: SELLをスキップ 価格=${:.1f}", price)
+                self._self_cross_skip_count += 1
+                self._check_and_clear_on_excessive_skips()
                 return
             order = await self.adapter.place_order(req)
             if side == OrderSide.BUY:
@@ -1419,4 +1748,230 @@ class GridEngine:
             pass
         except Exception as e:
             logger.error("クローズ済みPnL取得エラー: {}", e)
+
+    async def _handle_schedule_exit(self) -> None:
+        """スケジュール外に出た時の処理
+
+        環境変数 EDGEX_OUT_OF_SCHEDULE_ACTION で挙動を制御:
+        - "nothing": 全指値注文をキャンセルし、ポジションはそのまま維持して終了
+        - "auto" または未設定: 指値でクローズを試み、1分後に約定していなければ成行でクローズ
+        - "immediately": 即時成行でクローズ
+        """
+        action = os.getenv("EDGEX_OUT_OF_SCHEDULE_ACTION", "auto").lower().strip()
+
+        logger.warning("=" * 80)
+        logger.warning("SCHEDULE ENDED (action={})", action)
+        logger.warning("=" * 80)
+
+        try:
+            # 全注文をキャンセル（全アクション共通）
+            logger.warning("Canceling all open orders...")
+            active_orders = await self.adapter.list_active_orders(self.symbol)
+            cancel_count = 0
+            for order in active_orders:
+                try:
+                    order_id = (
+                        order.get("orderId")
+                        or order.get("id")
+                        or order.get("order_id")
+                        or order.get("clientOrderId")
+                    )
+                    if order_id:
+                        await self.adapter.cancel_order(str(order_id))
+                        cancel_count += 1
+                        await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.debug(f"Failed to cancel order {order_id}: {e}")
+            logger.warning(f"Canceled {cancel_count} open orders")
+
+            # 内部トラッキングをクリア
+            self.placed_buy_px_to_id.clear()
+            self.placed_sell_px_to_id.clear()
+            self.initialized = False
+
+            if action == "nothing":
+                # ポジションは触らず終了
+                logger.warning("EDGEX_OUT_OF_SCHEDULE_ACTION=nothing: 注文キャンセル完了、ポジションは維持")
+            elif action == "immediately":
+                # 即時成行でクローズ
+                logger.warning("EDGEX_OUT_OF_SCHEDULE_ACTION=immediately: 成行で即時クローズ")
+                if hasattr(self.adapter, 'close_position_from_websocket'):
+                    closed = await self.adapter.close_position_from_websocket(self.symbol)
+                    if closed:
+                        logger.warning("Position closed with market order")
+                    else:
+                        logger.info("No position to close")
+            else:
+                # auto: 指値でクローズを試み、1分後に約定していなければ成行
+                logger.warning("EDGEX_OUT_OF_SCHEDULE_ACTION=auto: 指値でクローズ試行（1分後に成行フォールバック）")
+                await self._close_position_with_limit_then_market()
+
+        except Exception as e:
+            logger.error(f"Error during schedule exit handling: {e}", exc_info=True)
+
+        logger.warning("Schedule exit handling complete")
+
+    async def _close_position_with_limit_then_market(self) -> None:
+        """指値でポジションクローズを試み、1分後に約定していなければ成行でクローズ"""
+        if not hasattr(self.adapter, '_ws_client_private') or self.adapter._ws_client_private is None:
+            logger.warning("WebSocket client not available - falling back to market order")
+            if hasattr(self.adapter, 'close_position_from_websocket'):
+                await self.adapter.close_position_from_websocket(self.symbol)
+            return
+
+        # WebSocketからポジション情報を取得
+        all_positions = self.adapter._ws_client_private.all_positions
+        if not all_positions:
+            logger.info("No position data from WebSocket")
+            return
+
+        # ポジションサイズを計算
+        total_size = 0.0
+        for position in all_positions:
+            open_size_str = position.get("openSize")
+            if open_size_str is None:
+                continue
+            size = float(open_size_str)
+            if abs(size) < 0.0001:
+                continue
+            total_size += size
+
+        if abs(total_size) < 0.0001:
+            logger.info("Total position size is zero - nothing to close")
+            return
+
+        # クローズ方向と価格を決定
+        abs_total_size = abs(total_size)
+        if total_size > 0:
+            # LONG → SELLでクローズ
+            close_side = OrderSide.SELL
+            side_name = "LONG"
+        else:
+            # SHORT → BUYでクローズ
+            close_side = OrderSide.BUY
+            side_name = "SHORT"
+
+        # 現在価格を取得
+        mid_price = None
+        if hasattr(self.adapter, 'get_current_price_from_websocket'):
+            mid_price = self.adapter.get_current_price_from_websocket()
+        if mid_price is None:
+            ticker = await self.adapter.get_ticker(self.symbol)
+            mid_price = float(ticker.price)
+
+        # 指値価格: 現在価格から5ドル有利な価格
+        if close_side == OrderSide.SELL:
+            limit_price = mid_price + 5.0  # 売りは高めに
+        else:
+            limit_price = mid_price - 5.0  # 買いは安めに
+
+        logger.warning(f"Placing limit order to close {side_name} position: size={abs_total_size}, price={limit_price}")
+
+        # 指値注文を発注
+        limit_order = OrderRequest(
+            symbol=self.symbol,
+            side=close_side,
+            type=OrderType.LIMIT,
+            quantity=abs_total_size,
+            price=limit_price,
+            time_in_force=TimeInForce.GTC,
+        )
+
+        try:
+            result = await self.adapter.place_order(limit_order)
+            limit_order_id = result.id
+            logger.warning(f"Limit close order placed: {limit_order_id}")
+        except Exception as e:
+            logger.error(f"Failed to place limit close order: {e}")
+            # 指値が失敗したら即成行
+            if hasattr(self.adapter, 'close_position_from_websocket'):
+                await self.adapter.close_position_from_websocket(self.symbol)
+            return
+
+        # 1分待機
+        logger.info("Waiting 60 seconds for limit order to fill...")
+        await asyncio.sleep(60)
+
+        # 注文がまだアクティブか確認
+        try:
+            active_orders = await self.adapter.list_active_orders(self.symbol)
+            order_still_active = False
+            for order in active_orders:
+                order_id = (
+                    order.get("orderId")
+                    or order.get("id")
+                    or order.get("order_id")
+                    or order.get("clientOrderId")
+                )
+                if str(order_id) == str(limit_order_id):
+                    order_still_active = True
+                    break
+
+            if order_still_active:
+                # まだ約定していない → キャンセルして成行
+                logger.warning("Limit order not filled after 60s - canceling and using market order")
+                try:
+                    await self.adapter.cancel_order(limit_order_id)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+
+                if hasattr(self.adapter, 'close_position_from_websocket'):
+                    closed = await self.adapter.close_position_from_websocket(self.symbol)
+                    if closed:
+                        logger.warning("Position closed with market order (fallback)")
+            else:
+                logger.info("Limit close order filled successfully")
+
+        except Exception as e:
+            logger.error(f"Error checking limit order status: {e}")
+            # エラー時は念のため成行でクローズ試行
+            if hasattr(self.adapter, 'close_position_from_websocket'):
+                await self.adapter.close_position_from_websocket(self.symbol)
+
+    def _periodic_clear_placed_maps(self) -> None:
+        """1時間に1回、placed_buy/sell_px_to_idとスキップカウントをクリア"""
+        now = time.time()
+
+        # placed_buy/sell_px_to_idの定期クリア
+        if now - self._last_placed_clear_ts >= self._placed_clear_interval_sec:
+            buy_count = len(self.placed_buy_px_to_id)
+            sell_count = len(self.placed_sell_px_to_id)
+            if buy_count > 0 or sell_count > 0:
+                logger.info(
+                    "定期クリア(1時間): placed_buy={}件, placed_sell={}件 をクリア",
+                    buy_count, sell_count
+                )
+            self.placed_buy_px_to_id.clear()
+            self.placed_sell_px_to_id.clear()
+            self._last_placed_clear_ts = now
+
+        # スキップカウントの定期クリア
+        if now - self._last_skip_clear_ts >= self._skip_clear_interval_sec:
+            if self._self_cross_skip_count > 0:
+                logger.info(
+                    "定期クリア(1時間): 自己クロススキップカウント={}件 をリセット",
+                    self._self_cross_skip_count
+                )
+            self._self_cross_skip_count = 0
+            self._last_skip_clear_ts = now
+
+    def _check_and_clear_on_excessive_skips(self) -> None:
+        """自己クロススキップが閾値を超えたらplaced_mapをクリア
+
+        閾値: 1分間にGRID_LEVELS_PER_SIDEの3倍
+        """
+        threshold = self.levels * 3
+        if self._self_cross_skip_count >= threshold:
+            logger.warning(
+                "自己クロススキップ過多({}>={})により強制クリア: placed_buy={}件, placed_sell={}件",
+                self._self_cross_skip_count,
+                threshold,
+                len(self.placed_buy_px_to_id),
+                len(self.placed_sell_px_to_id)
+            )
+            self.placed_buy_px_to_id.clear()
+            self.placed_sell_px_to_id.clear()
+            self._self_cross_skip_count = 0
+            self._last_skip_clear_ts = time.time()
 # touch test 2025-11-01T23:11:35

@@ -104,3 +104,114 @@ Dockerfileを選択
 - `EDGEX_INITIAL_BALANCE_USD`: 初期残高（USD）- リカバリーの基準値（例: `400.0`）
 - `EDGEX_RECOVERY_ENFORCE_LEVEL_USD`: リカバリーモードを有効にする最小損失額（USD）（デフォルト: `3.0`）
   - 初期残高から指定額以上の損失が出た場合のみリカバリーモードが発動
+
+## 2.6 稼働スケジュール設定
+
+リモートのJSONファイルから稼働スケジュールを取得し、指定された時間帯のみBotを稼働させる機能です。
+
+- スケジュールURL: `https://zaramcei.github.io/edgex-grid/schedule/schedule.json`
+- スケジュールが取得できない場合でも、既存のスケジュール情報で動作を継続
+
+**スケジュール機能の有効/無効:**
+- `EDGEX_USE_SCHEDULE`: スケジュール機能の有効/無効（デフォルト: `true`）
+  - 未設定または空欄: スケジュール機能が有効
+  - `false`, `0`, `no`: スケジュール機能が無効（常時稼働）
+
+**スケジュールタイプの選択:**
+- `EDGEX_USE_SCHEDULE_TYPE`: 使用するスケジュールタイプ（デフォルト: `normal`）
+  - `normal`: 通常稼働（短めの稼働時間）
+  - `aggressive`: 攻め稼働（長めの稼働時間）
+  - スケジュールJSONに定義された任意のタイプ名を指定可能
+
+**設定例:**
+```
+EDGEX_USE_SCHEDULE_TYPE=normal     # 通常稼働スケジュールを使用
+EDGEX_USE_SCHEDULE_TYPE=aggressive # 攻め稼働スケジュールを使用
+```
+
+**挙動:**
+- 5分ごとにリモートからスケジュールJSONを取得・更新
+- スケジュール時間外の場合、グリッド注文は発注されず待機状態になる
+- `lot_coefficient`: グリッド注文のサイズに掛ける係数（例: `0.5`なら通常の0.5倍のサイズで注文）
+
+**スケジュール外への移行時の動作:**
+
+稼働時間内から時間外に移行した際の動作を環境変数で制御できます。
+
+- `EDGEX_OUT_OF_SCHEDULE_ACTION`: スケジュール外に出た時の動作（デフォルト: `auto`）
+  - `nothing`: 全指値注文をキャンセルし、ポジションはそのまま維持して終了。裁量でクローズしたい場合に使用
+  - `auto`: 現在価格から5ドル有利な価格で指値クローズ注文を出し、1分以内に約定しなければ成行でクローズすることで注文手数料の削減とリスク管理を両立
+  - `immediately`: 即座に成行でポジションをクローズ、注文手数料はTAKERだが損失拡大リスクは即座に無くなる
+
+
+## 2.7 ポジションサイズ制限（REDUCE_MODE）
+
+ポジションサイズが一定の閾値を超えた場合、ポジションを積み増す方向の注文をスキップし、ポジションを減らす方向の注文のみを許可する機能です。
+
+BTCとRATIOの2種類から**どちらか一方のみ**を設定する必要があります。両方設定した場合や両方未設定の場合、`LIMIT` より `REDUCE_ONLY`の方が大きい（矛盾していて意味のない設定）場合は起動時にエラーで終了します。
+
+### BTC絶対値による制限
+
+ポジションサイズ（BTC）の絶対値で制限します。
+
+- `EDGEX_POSITION_SIZE_LIMIT_BTC`: この値以上で`REDUCE_MODE`に突入（例: `0.1`）
+- `EDGEX_POSITION_SIZE_REDUCE_ONLY_BTC`: この値を下回るまで積み増し禁止（例: `0.05`）
+
+**例:**
+```
+EDGEX_POSITION_SIZE_LIMIT_BTC=0.1
+EDGEX_POSITION_SIZE_REDUCE_ONLY_BTC=0.05
+
+ポジション: 0.08 BTC → 通常モード（BUY/SELL両方OK）
+ポジション: 0.10 BTC → REDUCE_MODE突入（積み増し禁止）
+ポジション: 0.06 BTC → REDUCE_MODE継続
+ポジション: 0.04 BTC → REDUCE_MODE解除（BUY/SELL両方OK）
+```
+
+### RATIO（総資産比率）による制限
+
+ポジション価値が総資産に対して何%かで制限します。
+動作確認時は
+
+- `EDGEX_POSITION_SIZE_LIMIT_RATIO`: `0.5`
+- `EDGEX_POSITION_SIZE_REDUCE_ONLY_RATIO`: `0.25`
+
+の設定がおすすめです。
+
+**計算式:**
+```
+current_ratio = (現在BTC価格 × ポジションサイズ) / 総資産(initial_asset)
+```
+
+- `EDGEX_POSITION_SIZE_LIMIT_RATIO`: この割合(%)以上で`REDUCE_MODE`に突入（例: `50.0`）
+- `EDGEX_POSITION_SIZE_REDUCE_ONLY_RATIO`: この割合(%)を下回るまで積み増し禁止（例: `30.0`）
+
+**例:**
+```
+EDGEX_POSITION_SIZE_LIMIT_RATIO=50.0
+EDGEX_POSITION_SIZE_REDUCE_ONLY_RATIO=30.0
+
+総資産: 10,000 USD / BTC価格: 100,000 USD
+
+ポジション: 0.04 BTC → ratio=40% → 通常モード
+ポジション: 0.05 BTC → ratio=50% → REDUCE_MODE突入
+ポジション: 0.035 BTC → ratio=35% → REDUCE_MODE継続
+ポジション: 0.025 BTC → ratio=25% → REDUCE_MODE解除
+```
+
+**挙動:**
+1. ポジションサイズが `LIMIT` 値以上になると `REDUCE_MODE` に突入
+2. `REDUCE_MODE` 中はポジションを積み増す方向の注文をスキップ
+   - LONG保持中: BUY注文をスキップ、SELL注文のみ許可
+   - SHORT保持中: SELL注文をスキップ、BUY注文のみ許可
+3. ポジションサイズが `REDUCE_ONLY` 値を下回ると `REDUCE_MODE` を解除
+4. 通常モードに戻り、両方向の注文を再開
+
+**設定方法:**
+
+
+**バリデーション:**
+- BTCとRATIOの両方を設定 → エラー終了
+- BTCもRATIOも未設定 → エラー終了
+- LIMITのみ設定してREDUCE_ONLY未設定 → エラー終了
+- REDUCE_ONLY >= LIMIT → エラー終了（REDUCE_ONLYはLIMITより小さい必要あり）
