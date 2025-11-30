@@ -65,6 +65,9 @@ class GridEngine:
         self.placed_buy_px_to_id: Dict[float, str] = {}
         self.placed_sell_px_to_id: Dict[float, str] = {}
 
+        # ループ内で共有するアクティブ注文キャッシュ（API呼び出し削減用）
+        self._cached_active_orders: list = []
+
         # 定期クリア用タイムスタンプ（1時間に1回）
         self._last_placed_clear_ts: float = time.time()
         self._placed_clear_interval_sec: float = 3600.0  # 1時間
@@ -416,6 +419,7 @@ class GridEngine:
                                 # Clear our internal tracking
                                 self.placed_buy_px_to_id.clear()
                                 self.placed_sell_px_to_id.clear()
+                                self._cached_active_orders = []
                             except Exception as e:
                                 logger.error(f"Error canceling orders: {e}", exc_info=True)
 
@@ -495,6 +499,7 @@ class GridEngine:
                                 # Clear our internal tracking
                                 self.placed_buy_px_to_id.clear()
                                 self.placed_sell_px_to_id.clear()
+                                self._cached_active_orders = []
                             except Exception as e:
                                 logger.error(f"Error canceling orders: {e}", exc_info=True)
 
@@ -574,6 +579,7 @@ class GridEngine:
                                 # Clear our internal tracking
                                 self.placed_buy_px_to_id.clear()
                                 self.placed_sell_px_to_id.clear()
+                                self._cached_active_orders = []
                             except Exception as e:
                                 logger.error(f"Error canceling orders: {e}", exc_info=True)
 
@@ -657,6 +663,7 @@ class GridEngine:
                                 # Clear our internal tracking
                                 self.placed_buy_px_to_id.clear()
                                 self.placed_sell_px_to_id.clear()
+                                self._cached_active_orders = []
                             except Exception as e:
                                 logger.error(f"Error canceling orders: {e}", exc_info=True)
 
@@ -743,6 +750,7 @@ class GridEngine:
                                 # Clear our internal tracking
                                 self.placed_buy_px_to_id.clear()
                                 self.placed_sell_px_to_id.clear()
+                                self._cached_active_orders = []
                             except Exception as e:
                                 logger.error(f"Error canceling orders: {e}", exc_info=True)
 
@@ -849,9 +857,16 @@ class GridEngine:
                     except Exception:
                         pass
 
+                    # ループ頭で1回だけlist_active_ordersを取得しキャッシュ（429対策）
+                    try:
+                        self._cached_active_orders = await self.adapter.list_active_orders(self.symbol)
+                    except Exception as e:
+                        logger.debug("list_active_orders failed (use stale cache): {}", e)
+                        # 失敗した場合は既存キャッシュを使い続ける
+
                     # 周期的に取引所のOPEN注文と突合（3ループに1回など）
                     if getattr(self, "active_sync_every", 0) > 0 and (self._loop_iter % self.active_sync_every == 0):
-                        await self._sync_active_orders_from_exchange()
+                        self._sync_active_orders_from_cache()
 
                     # グリッド配置
                     await self._ensure_grid(mid_price)
@@ -875,13 +890,9 @@ class GridEngine:
             await self.adapter.close()
             logger.info("グリッドエンジン停止")
 
-    async def _sync_active_orders_from_exchange(self) -> None:
-        """取引所のOPEN注文を取得し、内部マップを実態に同期する（BIN用の軽量突合）。"""
-        try:
-            active_orders = await self.adapter.list_active_orders(self.symbol)
-        except Exception as e:
-            logger.debug("active sync skip: {}", e)
-            return
+    def _sync_active_orders_from_cache(self) -> None:
+        """キャッシュされたOPEN注文から内部マップを同期する（API呼び出しなし）。"""
+        active_orders = self._cached_active_orders
 
         new_buys: Dict[float, str] = {}
         new_sells: Dict[float, str] = {}
@@ -927,6 +938,22 @@ class GridEngine:
         self.placed_buy_px_to_id = new_buys
         self.placed_sell_px_to_id = new_sells
         logger.debug("active sync: buy={} sell={}", len(new_buys), len(new_sells))
+
+    def _remove_from_cache(self, order_id: str) -> None:
+        """キャッシュから指定IDの注文を削除する（キャンセル成功時に呼ぶ）"""
+        self._cached_active_orders = [
+            o for o in self._cached_active_orders
+            if str(o.get("orderId") or o.get("id") or o.get("order_id") or "") != order_id
+        ]
+
+    def _add_to_cache(self, order_id: str, side: str, price: float) -> None:
+        """キャッシュに注文を追加する（発注成功時に呼ぶ）"""
+        self._cached_active_orders.append({
+            "orderId": order_id,
+            "side": side,
+            "price": str(price),
+            "status": "OPEN",
+        })
 
     async def _ensure_grid(self, mid_price: float):
         """
@@ -1581,20 +1608,23 @@ class GridEngine:
             order = await self.adapter.place_order(req)
             if side == OrderSide.BUY:
                 self.placed_buy_px_to_id[price] = order.id
+                self._add_to_cache(order.id, "BUY", price)
                 logger.info("買い注文発注: 価格=${:.1f} ID={}", price, order.id)
             else:
                 self.placed_sell_px_to_id[price] = order.id
+                self._add_to_cache(order.id, "SELL", price)
                 logger.info("売り注文発注: 価格=${:.1f} ID={}", price, order.id)
         except Exception as e:
             logger.error("注文発注エラー: side={} price={} error={}", side, price, e)
 
     async def _replenish_if_filled(self):
-        """約定した注文を確認し、補充する"""
+        """約定した注文を確認し、補充する（キャッシュを使用）"""
         # BIN固定モードでは、約定イベントに依存せず ensure_grid が目標集合に揃えるためスキップ
         if getattr(self, "bin_mode", False):
             return
         try:
-            active_orders = await self.adapter.list_active_orders(self.symbol)
+            # キャッシュを使用（API呼び出し削減）
+            active_orders = self._cached_active_orders
             # EdgeXアダプタは dict を返すため堅牢にIDを抽出する
             active_ids = set()
             for o in active_orders:
@@ -1650,6 +1680,7 @@ class GridEngine:
                     far_sell_id = self.placed_sell_px_to_id.pop(far_sell_px)
                     try:
                         await self.adapter.cancel_order(far_sell_id)
+                        self._remove_from_cache(far_sell_id)
                     except Exception:
                         logger.debug("cancel far SELL failed (ignore): id={} px={}", far_sell_id, far_sell_px)
                     await asyncio.sleep(self.op_spacing_sec)
@@ -1679,6 +1710,7 @@ class GridEngine:
                     far_buy_id = self.placed_buy_px_to_id.pop(far_buy_px)
                     try:
                         await self.adapter.cancel_order(far_buy_id)
+                        self._remove_from_cache(far_buy_id)
                     except Exception:
                         logger.debug("cancel far BUY failed (ignore): id={} px={}", far_buy_id, far_buy_px)
                     await asyncio.sleep(self.op_spacing_sec)
@@ -1724,6 +1756,7 @@ class GridEngine:
                 for oid in unknown[:3]:
                     try:
                         await self.adapter.cancel_order(oid)
+                        self._remove_from_cache(oid)
                         logger.info("余剰注文をキャンセル: id={}", oid)
                     except Exception:
                         logger.debug("余剰注文キャンセル失敗(無視): id={}", oid)
@@ -1787,6 +1820,7 @@ class GridEngine:
             # 内部トラッキングをクリア
             self.placed_buy_px_to_id.clear()
             self.placed_sell_px_to_id.clear()
+            self._cached_active_orders = []
             self.initialized = False
 
             if action == "nothing":
@@ -1944,6 +1978,7 @@ class GridEngine:
                 )
             self.placed_buy_px_to_id.clear()
             self.placed_sell_px_to_id.clear()
+            self._cached_active_orders = []
             self._last_placed_clear_ts = now
 
         # スキップカウントの定期クリア
@@ -1972,6 +2007,7 @@ class GridEngine:
             )
             self.placed_buy_px_to_id.clear()
             self.placed_sell_px_to_id.clear()
+            self._cached_active_orders = []
             self._self_cross_skip_count = 0
             self._last_skip_clear_ts = time.time()
 # touch test 2025-11-01T23:11:35
