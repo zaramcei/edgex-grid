@@ -17,6 +17,11 @@ from bot.adapters.base import ExchangeAdapter
 from bot.models.types import Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce
 
 
+class RateLimitError(Exception):
+    """429レートリミットエラー - grid_engineでキャッチしてループをスキップする"""
+    pass
+
+
 class EdgeXSDKAdapter(ExchangeAdapter):
     def __init__(
         self,
@@ -38,6 +43,11 @@ class EdgeXSDKAdapter(ExchangeAdapter):
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
+
+    def _is_rate_limit_error(self, msg: str) -> bool:
+        """429レートリミットエラーかどうかを判定"""
+        msg_lower = msg.lower()
+        return "429" in msg or "too many requests" in msg_lower or "cloudflare" in msg_lower or "just a moment" in msg_lower or "rate limit" in msg_lower
 
     async def connect(self) -> None:
         self._client = EdgeXClient(
@@ -857,6 +867,11 @@ class EdgeXSDKAdapter(ExchangeAdapter):
             if status_code is not None:
                 detail["status"] = status_code
 
+            # 429レートリミットの場合は専用例外を投げる
+            error_str = str(detail.get("raw_error", "")) + str(detail.get("msg", ""))
+            if self._is_rate_limit_error(error_str) or status_code == 429:
+                raise RateLimitError(f"place_order rate limited: {detail}") from e
+
             # Raise a concise but rich message
             raise RuntimeError(f"edgex order failed: {detail}") from e
         order_id = str(((res or {}).get("data") or {}).get("orderId") or "")
@@ -924,6 +939,8 @@ class EdgeXSDKAdapter(ExchangeAdapter):
                     resp = await client.order.get_active_orders(params_obj)  # type: ignore[arg-type]
                 except Exception as e:
                     logger.debug("get_active_orders failed: {}", e)
+                    if self._is_rate_limit_error(str(e)):
+                        raise RateLimitError(f"list_active_orders rate limited: {e}") from e
                     resp = None
 
         # 2) Fallback: legacy get_active_order_page variants
@@ -998,6 +1015,8 @@ class EdgeXSDKAdapter(ExchangeAdapter):
                     resp = await meth(params=call_params)  # type: ignore[arg-type]
                 except Exception as e:
                     logger.debug("get_active_order_page(params=) failed: {}", e)
+                    if self._is_rate_limit_error(str(e)):
+                        raise RateLimitError(f"list_active_orders rate limited: {e}") from e
                     resp = None
             else:
                 try:
@@ -1005,6 +1024,8 @@ class EdgeXSDKAdapter(ExchangeAdapter):
                     resp = await meth(**params) if params else await meth()
                 except Exception as e:
                     logger.debug("get_active_order_page failed: {}", e)
+                    if self._is_rate_limit_error(str(e)):
+                        raise RateLimitError(f"list_active_orders rate limited: {e}") from e
                     resp = None
 
         # Normalize response rows

@@ -11,6 +11,7 @@ import time
 from loguru import logger
 
 from bot.adapters.base import ExchangeAdapter
+from bot.adapters.edgex_sdk import RateLimitError
 from bot.models.types import OrderRequest, OrderSide, OrderType, TimeInForce
 from bot.utils.trade_logger import TradeLogger
 from bot.schedule_manager import ScheduleManager
@@ -874,10 +875,17 @@ class GridEngine:
                     # 約定確認と補充
                     await self._replenish_if_filled()
 
+                except RateLimitError as e:
+                    # 429レートリミット検出時はループをスキップして待機
+                    logger.warning("429レートリミット検出、ループをスキップ: {}", e)
+                    await asyncio.sleep(self.poll_interval_sec)
+                    continue
+
                 except Exception as e:
                     logger.warning("グリッドループエラー: {}", e)
                     logger.debug("グリッドループ終了: iter={} 待機時間={}秒", self._loop_iter, self.poll_interval_sec)
                     await asyncio.sleep(self.poll_interval_sec)
+                    continue
 
                 # 定期: クローズ損益の新規行を取り込み
                 await self._poll_closed_pnl_once()
@@ -1035,18 +1043,53 @@ class GridEngine:
                     pass
                 await asyncio.sleep(self.op_spacing_sec)
 
-            # 欠け（近似含め存在しないターゲット）を追加
-            for px in sorted(target_buys):
-                if not any(abs(cb - px) <= tol for cb in keep_buys):
-                    if self._has_min_gap(self.placed_buy_px_to_id, px):
-                        await self._place_order(OrderSide.BUY, px)
-                        await asyncio.sleep(self.op_spacing_sec)
+            # 欠け（近似含め存在しないターゲット）を追加（交互発注・ポジションクローズ方向優先・価格近い順）
+            # BUYは現在価格に近い順（降順）、SELLは現在価格に近い順（昇順）
+            missing_buys = sorted([px for px in target_buys if not any(abs(cb - px) <= tol for cb in keep_buys)], reverse=True)
+            missing_sells = sorted([px for px in target_sells if not any(abs(cs - px) <= tol for cs in keep_sells)])
 
-            for px in sorted(target_sells):
-                if not any(abs(cs - px) <= tol for cs in keep_sells):
-                    if self._has_min_gap(self.placed_sell_px_to_id, px):
-                        await self._place_order(OrderSide.SELL, px)
-                        await asyncio.sleep(self.op_spacing_sec)
+            if missing_buys or missing_sells:
+                # ポジション方向を取得してクローズ方向を優先
+                _, pos_side = self._get_current_position_size_and_side()
+                close_first = "SELL" if pos_side != "SHORT" else "BUY"
+
+                buy_iter = iter(missing_buys)
+                sell_iter = iter(missing_sells)
+                current_side = close_first
+
+                while True:
+                    placed = False
+                    if current_side == "BUY":
+                        px = next(buy_iter, None)
+                        if px is not None and self._has_min_gap(self.placed_buy_px_to_id, px):
+                            await self._place_order(OrderSide.BUY, px)
+                            await asyncio.sleep(self.op_spacing_sec)
+                            placed = True
+                    else:
+                        px = next(sell_iter, None)
+                        if px is not None and self._has_min_gap(self.placed_sell_px_to_id, px):
+                            await self._place_order(OrderSide.SELL, px)
+                            await asyncio.sleep(self.op_spacing_sec)
+                            placed = True
+
+                    current_side = "SELL" if current_side == "BUY" else "BUY"
+
+                    # 両方のイテレータが尽きたら終了
+                    if not placed:
+                        # もう一方も試す
+                        if current_side == "BUY":
+                            px = next(buy_iter, None)
+                            if px is not None and self._has_min_gap(self.placed_buy_px_to_id, px):
+                                await self._place_order(OrderSide.BUY, px)
+                                await asyncio.sleep(self.op_spacing_sec)
+                                continue
+                        else:
+                            px = next(sell_iter, None)
+                            if px is not None and self._has_min_gap(self.placed_sell_px_to_id, px):
+                                await self._place_order(OrderSide.SELL, px)
+                                await asyncio.sleep(self.op_spacing_sec)
+                                continue
+                        break
 
             # 初期化フラグ
             if not self.initialized:
@@ -1063,26 +1106,59 @@ class GridEngine:
             except Exception:
                 center = float(mid_price)
                 center_units = round(center / self.step)
-            # 初回: 目標列を構築して配置（従来通り）
+            # 初回: 目標列を構築して配置（交互発注・ポジションクローズ方向優先・価格近い順）
             if not self.initialized:
-                buy_targets = [center - k * self.step for k in range(self.levels, 0, -1)]
-                sell_targets = [center + k * self.step for k in range(1, self.levels + 1)]
+                # 現在価格に近い順にソート（BUYは降順=高い方から、SELLは昇順=低い方から）
+                buy_targets = sorted([center - k * self.step for k in range(self.levels, 0, -1)], reverse=True)
+                sell_targets = sorted([center + k * self.step for k in range(1, self.levels + 1)])
 
+                # ポジション方向を取得してクローズ方向を優先
+                _, pos_side = self._get_current_position_size_and_side()
+                # LONG → 先にSELL（クローズ方向）, SHORT → 先にBUY, なし → SELL優先
+                close_first = "SELL" if pos_side != "SHORT" else "BUY"
+                logger.info("BIN: 初期配置開始 pos_side={} close_first={}", pos_side, close_first)
+
+                # 交互発注用のイテレータ
+                buy_iter = iter(buy_targets)
+                sell_iter = iter(sell_targets)
                 add_buys = 0
                 add_sells = 0
-                for px in buy_targets:
-                    if self.max_new_per_loop and add_buys >= self.max_new_per_loop:
-                        break
-                    await self._place_order(OrderSide.BUY, px)
-                    add_buys += 1
-                    await asyncio.sleep(self.op_spacing_sec)
+                total_max = self.max_new_per_loop * 2 if self.max_new_per_loop else None
 
-                for px in sell_targets:
-                    if self.max_new_per_loop and add_sells >= self.max_new_per_loop:
+                # 交互に発注（クローズ方向から開始）
+                current_side = close_first
+                while True:
+                    if total_max and (add_buys + add_sells) >= total_max:
                         break
-                    await self._place_order(OrderSide.SELL, px)
-                    add_sells += 1
-                    await asyncio.sleep(self.op_spacing_sec)
+
+                    placed = False
+                    if current_side == "BUY" and add_buys < self.levels:
+                        px = next(buy_iter, None)
+                        if px is not None:
+                            await self._place_order(OrderSide.BUY, px)
+                            add_buys += 1
+                            await asyncio.sleep(self.op_spacing_sec)
+                            placed = True
+                    elif current_side == "SELL" and add_sells < self.levels:
+                        px = next(sell_iter, None)
+                        if px is not None:
+                            await self._place_order(OrderSide.SELL, px)
+                            add_sells += 1
+                            await asyncio.sleep(self.op_spacing_sec)
+                            placed = True
+
+                    # サイドを交互に切り替え
+                    current_side = "SELL" if current_side == "BUY" else "BUY"
+
+                    # 両方のイテレータが尽きたら終了
+                    if add_buys >= self.levels and add_sells >= self.levels:
+                        break
+                    # 片方が尽きてもう片方も発注できなかった場合
+                    if not placed and add_buys >= self.levels and add_sells >= self.levels:
+                        break
+                    # 無限ループ防止
+                    if add_buys >= self.levels and add_sells >= self.levels:
+                        break
 
                 self.initialized = True
                 self._bin_center_units = center_units
