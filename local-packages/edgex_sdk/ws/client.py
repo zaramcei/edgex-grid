@@ -71,19 +71,19 @@ def _get_recovery_enforce_level() -> float:
 
 # Asset-based loss cut percentage threshold (configurable via environment variable)
 def _get_asset_losscut_percentage() -> float:
-    """Get asset-based loss cut percentage from environment variable (default: 3.0%)"""
+    """Get asset-based loss cut percentage from environment variable (default: 0 = disabled)"""
     try:
-        return float(os.getenv("EDGEX_ASSET_LOSSCUT_PERCENTAGE", "3.0"))
+        return float(os.getenv("EDGEX_ASSET_LOSSCUT_PERCENTAGE", "0"))
     except ValueError:
-        return 3.0
+        return 0
 
 # Asset-based take profit percentage threshold (configurable via environment variable)
 def _get_asset_takeprofit_percentage() -> float:
-    """Get asset-based take profit percentage from environment variable (default: 5.0%)"""
+    """Get asset-based take profit percentage from environment variable (default: 0 = disabled)"""
     try:
-        return float(os.getenv("EDGEX_ASSET_TAKE_PROFIT_PERCENTAGE", "5.0"))
+        return float(os.getenv("EDGEX_ASSET_TAKE_PROFIT_PERCENTAGE", "0"))
     except ValueError:
-        return 5.0
+        return 0
 
 LEVERAGE = _get_leverage()
 LOSSCUT_PERCENTAGE = _get_losscut_percentage()
